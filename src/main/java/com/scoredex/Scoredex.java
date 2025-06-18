@@ -59,7 +59,7 @@ public class Scoredex implements ModInitializer {
     private BufferedImage currentLegendaryScoreboardImage;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private MinecraftServer minecraftServer;
-    private final List<String> legendaries = new ArrayList<>();
+    private final Set<String> legendaries = new HashSet<>();
 
     private static class Config {
         int port = DEFAULT_PORT;
@@ -305,15 +305,26 @@ public class Scoredex implements ModInitializer {
                             if (playerName != null) {
                                 JsonObject advancementData = data.getAsJsonObject("advancementData");
                                 if (advancementData != null && advancementData.has("totalCaptureCount")) {
-                                    int capturedCount = advancementData.get("totalCaptureCount").getAsInt();
-                                    int shinyCount = advancementData.get("totalShinyCaptureCount").getAsInt();
 
                                     JsonObject aspectsCollected = advancementData.getAsJsonObject("aspectsCollected");
+                                    int capturedCount = 0;
+                                    int shinyCount = advancementData.get("totalShinyCaptureCount").getAsInt();
                                     int legendaryCount = 0;
-                                    for (String legendaryKey : legendaries) {
-                                        if (aspectsCollected.has(legendaryKey)) {
-                                            legendaryCount++;
+
+                                    List<String> genders = List.of("genderless", "male", "female");
+                                    for (String key : aspectsCollected.keySet()) {
+                                        if (legendaries.contains(key)) legendaryCount++;
+
+                                        int i = 0;
+                                        for (JsonElement v : aspectsCollected.get(key).getAsJsonArray()) {
+                                            String value = v.getAsString().trim().toLowerCase();
+                                            LOGGER.info("Raw value: '" + v.getAsString() + "'");
+                                            if (!genders.contains(value)) {
+                                                i++;
+                                            }
                                         }
+                                        if (i == 0) i = 1;
+                                        capturedCount += i;
                                     }
 
                                     scores.add(new PlayerScore(playerName, capturedCount, shinyCount, legendaryCount));
