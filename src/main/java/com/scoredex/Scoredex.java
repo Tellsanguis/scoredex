@@ -1,9 +1,6 @@
 package com.scoredex;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.gson.*;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
@@ -57,14 +54,19 @@ public class Scoredex implements ModInitializer {
     private final Path configPath;
     private Config config;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    private BufferedImage currentScoreboardImage;
+    private BufferedImage currentGeneralScoreboardImage;
+    private BufferedImage currentShinyScoreboardImage;
+    private BufferedImage currentLegendaryScoreboardImage;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private MinecraftServer minecraftServer;
+    private final Set<String> legendaries = new HashSet<>();
 
     private static class Config {
         int port = DEFAULT_PORT;
         int updateIntervalMinutes = UPDATE_INTERVAL_MINUTES;
         String imageTitle = "Scoreboard - Pokémon Capturés";
+        String shinyImageTitle = "Scoreboard - Shinies Capturés";
+        String legendaryImageTitle = "Scoreboard - Légendaires Capturés";
         String timeZone = "Europe/Paris";
         boolean autoDetectDataFolder = true;
         String manualDataFolderPath = "";
@@ -93,6 +95,18 @@ public class Scoredex implements ModInitializer {
     @Override
     public void onInitialize() {
         LOGGER.info("Initialisation du mod Scoredex...");
+
+        try (InputStream inputStream = Scoredex.class.getClassLoader().getResourceAsStream("assets/scoredex/legendaries.json");
+             InputStreamReader reader = new InputStreamReader(inputStream)) {
+            JsonArray jsonArray = JsonParser.parseReader(reader).getAsJsonArray();
+            for (JsonElement element : jsonArray)
+            {
+                legendaries.add(element.getAsString());
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
         CommandRegistrationCallback.EVENT.register((dispatcher, dedicated) -> {
             registerCommands(dispatcher);
         });
@@ -166,8 +180,8 @@ public class Scoredex implements ModInitializer {
     private void startWebServer() {
         try {
             server = HttpServer.create(new InetSocketAddress(config.port), 0);
-            server.createContext("/scoreboard.png", new ScoreboardHandler());
-            server.createContext("/api/scoreboard", new ScoreboardApiHandler());
+            server.createContext("/", new ScoreboardHandler());
+            server.createContext("/api/", new ScoreboardApiHandler());
             server.setExecutor(Executors.newCachedThreadPool());
             server.start();
             LOGGER.info("Serveur web démarré sur le port {}", config.port);
@@ -233,8 +247,9 @@ public class Scoredex implements ModInitializer {
                 return;
             }
             List<PlayerScore> scores = collectPlayerScores(dataFolderPath);
-            scores.sort(Comparator.comparingInt(PlayerScore::getScore).reversed());
-            currentScoreboardImage = generateScoreboardImage(scores);
+            currentGeneralScoreboardImage = generateScoreboardImage(scores, ScoreType.GENERAL);
+            currentShinyScoreboardImage = generateScoreboardImage(scores, ScoreType.SHINY);
+            currentLegendaryScoreboardImage = generateScoreboardImage(scores, ScoreType.LEGENDARY);
             LOGGER.info("Scoreboard mis à jour avec {} joueurs", scores.size());
         } catch (Exception e) {
             LOGGER.error("Erreur lors de la mise à jour du scoreboard", e);
@@ -265,10 +280,10 @@ public class Scoredex implements ModInitializer {
             List<PlayerScore> scores = collectPlayerScores(dataFolderPath);
 
             for (PlayerScore playerScore : scores) {
-                ScoreHolder holder = ScoreHolder.fromName(playerScore.getName());
+                ScoreHolder holder = ScoreHolder.fromName(playerScore.name());
                 ScoreAccess access = serverScoreboard.getOrCreateScore(holder, objective);
-                if (access.getScore() != playerScore.getScore()) {
-                    access.setScore(playerScore.getScore());
+                if (access.getScore() != playerScore.score()) {
+                    access.setScore(playerScore.score());
                 }
             }
         } catch (Exception e) {
@@ -290,8 +305,29 @@ public class Scoredex implements ModInitializer {
                             if (playerName != null) {
                                 JsonObject advancementData = data.getAsJsonObject("advancementData");
                                 if (advancementData != null && advancementData.has("totalCaptureCount")) {
-                                    int capturedCount = advancementData.get("totalCaptureCount").getAsInt();
-                                    scores.add(new PlayerScore(playerName, capturedCount));
+
+                                    JsonObject aspectsCollected = advancementData.getAsJsonObject("aspectsCollected");
+                                    int capturedCount = 0;
+                                    int shinyCount = advancementData.get("totalShinyCaptureCount").getAsInt();
+                                    int legendaryCount = 0;
+
+                                    List<String> genders = List.of("genderless", "male", "female");
+                                    for (String key : aspectsCollected.keySet()) {
+                                        if (legendaries.contains(key)) legendaryCount++;
+
+                                        int i = 0;
+                                        for (JsonElement v : aspectsCollected.get(key).getAsJsonArray()) {
+                                            String value = v.getAsString().trim().toLowerCase();
+                                            LOGGER.info("Raw value: '" + v.getAsString() + "'");
+                                            if (!genders.contains(value)) {
+                                                i++;
+                                            }
+                                        }
+                                        if (i == 0) i = 1;
+                                        capturedCount += i;
+                                    }
+
+                                    scores.add(new PlayerScore(playerName, capturedCount, shinyCount, legendaryCount));
                                 }
                             }
                         }
@@ -365,8 +401,26 @@ public class Scoredex implements ModInitializer {
             return 0;
         }
     }
+
+    private void sortPlayerScores(List<PlayerScore> scores, ScoreType scoreType) {
+        switch (scoreType) {
+            case SHINY:
+                scores.sort(Comparator.comparingInt(PlayerScore::shinyScore).reversed());
+                break;
+            case LEGENDARY:
+                scores.sort(Comparator.comparingInt(PlayerScore::legendaryScore).reversed());
+                break;
+            case GENERAL:
+            default:
+                scores.sort(Comparator.comparingInt(PlayerScore::score).reversed());
+                break;
+        }
+    }
     
-    private BufferedImage generateScoreboardImage(List<PlayerScore> scores) {
+    private BufferedImage generateScoreboardImage(List<PlayerScore> unsortedScores, ScoreType scoreType) {
+        List<PlayerScore> scores = new ArrayList<>(unsortedScores);
+        sortPlayerScores(scores, scoreType);
+
         int maxPlayers = Math.min(config.maxPlayers, scores.size());
         int columns = (int) Math.ceil((double) maxPlayers / config.rowsPerColumn);
         int width = 600 * columns;
@@ -396,7 +450,13 @@ public class Scoredex implements ModInitializer {
         g2d.setColor(titleTextColor);
         g2d.setFont(new Font("SansSerif", Font.BOLD, 28));
         FontMetrics headerFontMetrics = g2d.getFontMetrics();
-        String title = config.imageTitle;
+
+        String title = switch (scoreType) {
+            case SHINY -> config.shinyImageTitle;
+            case LEGENDARY -> config.legendaryImageTitle;
+            default -> config.imageTitle;
+        };
+
         int titleWidth = headerFontMetrics.stringWidth(title);
         g2d.drawString(title, (width - titleWidth) / 2, headerHeight / 2 + headerFontMetrics.getAscent() / 2);
 
@@ -424,7 +484,7 @@ public class Scoredex implements ModInitializer {
             g2d.fillRect(xOffset + 20, yPosition - 5, 560, 45);
 
             g2d.setColor(rank <= 3 ? topPlayerTextColor : textColor);
-            String scoreText = String.format("%d. %s: %d", rank, playerScore.getName(), playerScore.getScore());
+            String scoreText = String.format("%d. %s: %d", rank, playerScore.name(), playerScore.getScore(scoreType));
             g2d.drawString(scoreText, xOffset + 30, yPosition + scoreFontMetrics.getAscent());
         }
 
@@ -445,18 +505,27 @@ public class Scoredex implements ModInitializer {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             try {
-                if (currentScoreboardImage == null) {
+                BufferedImage image = null;
+                if (exchange.getRequestURI().getPath().endsWith("/scoreboard.png")) {
+                    image = currentGeneralScoreboardImage;
+                } else if (exchange.getRequestURI().getPath().endsWith("/shiny.png")) {
+                    image = currentShinyScoreboardImage;
+                } else if (exchange.getRequestURI().getPath().endsWith("/legendary.png")) {
+                    image = currentLegendaryScoreboardImage;
+                }
+
+                if (image == null) {
                     exchange.sendResponseHeaders(503, 0);
                     exchange.getResponseBody().close();
                     return;
                 }
-                
+
                 exchange.getResponseHeaders().add("Content-Type", "image/png");
                 exchange.getResponseHeaders().add("Cache-Control", "no-cache, no-store, must-revalidate");
                 exchange.sendResponseHeaders(200, 0);
                 
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                ImageIO.write(currentScoreboardImage, "PNG", baos);
+                ImageIO.write(image, "PNG", baos);
                 byte[] imageBytes = baos.toByteArray();
                 
                 OutputStream os = exchange.getResponseBody();
@@ -479,17 +548,26 @@ public class Scoredex implements ModInitializer {
                     sendJsonResponse(exchange, 404, Collections.singletonMap("error", "Data folder not found"));
                     return;
                 }
+
+                ScoreType scoreType = null;
+                if (exchange.getRequestURI().getPath().endsWith("/scoreboard")) {
+                    scoreType = ScoreType.GENERAL;
+                } else if (exchange.getRequestURI().getPath().endsWith("/shiny")) {
+                    scoreType = ScoreType.SHINY;
+                } else if (exchange.getRequestURI().getPath().endsWith("/legendary")) {
+                    scoreType = ScoreType.LEGENDARY;
+                }
                 
                 List<PlayerScore> scores = collectPlayerScores(dataFolderPath);
-                scores.sort(Comparator.comparingInt(PlayerScore::getScore).reversed());
+                sortPlayerScores(scores, scoreType);
                 
                 List<Map<String, Object>> scoreList = new ArrayList<>();
                 for (int i = 0; i < scores.size(); i++) {
                     PlayerScore score = scores.get(i);
                     Map<String, Object> playerData = new HashMap<>();
                     playerData.put("rank", i + 1);
-                    playerData.put("name", score.getName());
-                    playerData.put("score", score.getScore());
+                    playerData.put("name", score.name());
+                    playerData.put("score", score.getScore(scoreType));
                     scoreList.add(playerData);
                 }
                 
@@ -513,22 +591,21 @@ public class Scoredex implements ModInitializer {
             os.close();
         }
     }
-    
-    private static class PlayerScore {
-        private final String name;
-        private final int score;
-        
-        public PlayerScore(String name, int score) {
-            this.name = name;
-            this.score = score;
-        }
-        
-        public String getName() {
-            return name;
-        }
-        
-        public int getScore() {
-            return score;
+
+    private record PlayerScore(String name, int score, int shinyScore, int legendaryScore) {
+        int getScore(ScoreType scoreType) {
+            return switch (scoreType) {
+                case SHINY -> shinyScore;
+                case LEGENDARY -> legendaryScore;
+                default -> score;
+            };
         }
     }
+
+    private enum ScoreType {
+        GENERAL,
+        SHINY,
+        LEGENDARY
+    }
+
 }
